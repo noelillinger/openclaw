@@ -173,15 +173,38 @@ jobs:
             assert.equal(mutation.proofPage?.total, 41);
             assert.equal(mutation.proofPage?.hasMore, true);
 
-            const olderResult = await invoke("workboard_proof_list", "older-page", {
-              id: cardId,
-              limit: 40,
-              cursor: proofPage.nextCursor,
-            });
-            const older = olderResult.details;
-            assert.ok(older.proof.length > 0 && older.proof.length <= 40);
-            assert.ok(olderResult.textBytes <= MODEL_OUTPUT_BYTES);
-            assert.equal(older.proof.some((entry) => entry.id === firstProofId), true);
+            let olderCursor = proofPage.nextCursor;
+            let olderPageCount = 0;
+            let olderProofCount = 0;
+            let olderMaxTextBytes = 0;
+            let historicalRowRetrieved = false;
+            while (olderCursor) {
+              const olderResult = await invoke(
+                "workboard_proof_list",
+                `older-page-${olderPageCount + 1}`,
+                {
+                  id: cardId,
+                  limit: 40,
+                  cursor: olderCursor,
+                },
+              );
+              const older = olderResult.details;
+              assert.ok(older.proof.length > 0 && older.proof.length <= 40);
+              assert.ok(olderResult.textBytes <= MODEL_OUTPUT_BYTES);
+              olderPageCount += 1;
+              olderProofCount += older.proof.length;
+              olderMaxTextBytes = Math.max(olderMaxTextBytes, olderResult.textBytes);
+              historicalRowRetrieved ||= older.proof.some((entry) => entry.id === firstProofId);
+              if (!older.hasMore) {
+                assert.equal(older.nextCursor, undefined);
+                break;
+              }
+              assert.equal(typeof older.nextCursor, "string");
+              assert.notEqual(older.nextCursor, olderCursor);
+              olderCursor = older.nextCursor;
+              assert.ok(olderPageCount < 50);
+            }
+            assert.equal(historicalRowRetrieved, true);
 
             const canonical = await store.get(cardId);
             assert.equal(canonical?.metadata?.proof?.length, 41);
@@ -215,9 +238,10 @@ jobs:
                     proofPageTotal: mutation.proofPage.total,
                   },
                   olderProofPagination: {
-                    pageCount: older.proof.length,
-                    modelTextBytes: olderResult.textBytes,
-                    historicalRowRetrieved: true,
+                    pagesVisited: olderPageCount,
+                    recordsVisited: olderProofCount,
+                    maxModelTextBytes: olderMaxTextBytes,
+                    historicalRowRetrieved,
                   },
                   redaction: {
                     rawCardIdsPublished: false,
