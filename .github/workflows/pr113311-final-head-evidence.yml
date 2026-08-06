@@ -1,0 +1,236 @@
+name: PR 113311 final-head evidence
+
+on:
+  push:
+    branches:
+      - evidence/pr-113311-final-head
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-113311-final-head-evidence
+  cancel-in-progress: true
+
+jobs:
+  workboard-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout raw final head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: noelillinger/openclaw
+          ref: 949fbd400a981d972851609c4d8d8c104d545be5
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24.18.0
+
+      - name: Install pinned dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          package_manager="$(node -p "require('./package.json').packageManager")"
+          test "${package_manager#pnpm@}" != "$package_manager"
+          corepack prepare "$package_manager" --activate
+          pnpm install --frozen-lockfile --ignore-scripts=false
+
+      - name: Prove raw head identity
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "949fbd400a981d972851609c4d8d8c104d545be5"
+
+      - name: Emit redacted Workboard runtime evidence
+        shell: bash
+        env:
+          EXPECTED_HEAD: 949fbd400a981d972851609c4d8d8c104d545be5
+        run: |
+          set -euo pipefail
+          proof_state="$(mktemp -d "${RUNNER_TEMP}/openclaw-pr113311-proof.XXXXXX")"
+          export OPENCLAW_STATE_DIR="$proof_state"
+
+          node --import tsx --input-type=module <<'EOF'
+          import assert from "node:assert/strict";
+          import { DatabaseSync } from "node:sqlite";
+          import {
+            createWorkboardSqliteStores,
+            resolveWorkboardSqlitePath,
+          } from "./extensions/workboard/src/sqlite-store.ts";
+          import { WorkboardStore } from "./extensions/workboard/src/store.ts";
+          import { createWorkboardTools } from "./extensions/workboard/src/tools.ts";
+
+          const expectedHead = process.env.EXPECTED_HEAD;
+          const MODEL_OUTPUT_BYTES = 24 * 1024;
+          assert.match(expectedHead ?? "", /^[0-9a-f]{40}$/);
+          const dbPath = resolveWorkboardSqlitePath(process.env);
+          assert.ok(dbPath.startsWith(`${process.env.OPENCLAW_STATE_DIR}/`));
+
+          const stores = createWorkboardSqliteStores({ env: process.env });
+          const store = new WorkboardStore(stores.cards, {
+            boards: stores.boards,
+            subscriptions: stores.subscriptions,
+            attachments: stores.attachments,
+            dataVersion: stores.dataVersion,
+          });
+          const tools = new Map(
+            createWorkboardTools({
+              api: { runtime: {} },
+              store,
+              context: { agentId: "pr113311-secretless-evidence" },
+            }).map((tool) => [tool.name, tool]),
+          );
+
+          async function invoke(name, callId, params) {
+            const tool = tools.get(name);
+            assert.ok(tool, `missing tool: ${name}`);
+            const result = await tool.execute(callId, params);
+            assert.ok(result?.details && typeof result.details === "object");
+            const text = result.content?.[0]?.text;
+            assert.equal(typeof text, "string");
+            return {
+              details: result.details,
+              textBytes: Buffer.byteLength(text, "utf8"),
+            };
+          }
+
+          function sqliteSnapshot(cardId, proofId) {
+            const db = new DatabaseSync(dbPath, { readOnly: true });
+            try {
+              const historicalProof = db
+                .prepare(`
+                  SELECT id, card_id, ordinal, status, label, command, url, note, created_at
+                  FROM workboard_card_proof
+                  WHERE card_id = ? AND id = ?
+                `)
+                .get(cardId, proofId);
+              const proofTotal = db
+                .prepare("SELECT COUNT(*) AS total FROM workboard_card_proof WHERE card_id = ?")
+                .get(cardId)?.total;
+              const commentTotal = db
+                .prepare("SELECT COUNT(*) AS total FROM workboard_card_comments WHERE card_id = ?")
+                .get(cardId)?.total;
+              return { historicalProof, proofTotal, commentTotal };
+            } finally {
+              db.close();
+            }
+          }
+
+          try {
+            const created = await invoke("workboard_create", "create", {
+              title: "PR 113311 isolated proof",
+              notes: "Synthetic secretless evidence only.",
+            });
+            const cardId = created.details.card?.id;
+            assert.equal(typeof cardId, "string");
+
+            let firstProofId;
+            for (let index = 0; index < 41; index += 1) {
+              const added = await invoke("workboard_proof", `proof-${index}`, {
+                id: cardId,
+                status: "passed",
+                label: `Synthetic proof ${index}`,
+                note: `Isolated record ${index}: ${"x".repeat(1800)}`,
+              });
+              if (index === 0) {
+                firstProofId = added.details.proofId;
+              }
+            }
+            assert.equal(typeof firstProofId, "string");
+
+            const before = sqliteSnapshot(cardId, firstProofId);
+            assert.ok(before.historicalProof);
+            assert.equal(before.proofTotal, 41);
+            assert.equal(before.commentTotal, 0);
+
+            const mutationResult = await invoke("workboard_comment", "independent-mutation", {
+              id: cardId,
+              body: "Synthetic independent card mutation.",
+            });
+
+            const after = sqliteSnapshot(cardId, firstProofId);
+            assert.deepEqual(after.historicalProof, before.historicalProof);
+            assert.equal(after.proofTotal, 41);
+            assert.equal(after.commentTotal, 1);
+
+            const readResult = await invoke("workboard_read", "read-omitted", { id: cardId });
+            const omitted = readResult.details;
+            const embeddedProof = omitted.card?.metadata?.proof ?? [];
+            const cardBytes = Buffer.byteLength(JSON.stringify(omitted.card), "utf8");
+            const proofPage = omitted.card?.proofPage;
+            assert.ok(embeddedProof.length > 0 && embeddedProof.length < 40);
+            assert.ok(cardBytes <= MODEL_OUTPUT_BYTES);
+            assert.equal(proofPage?.total, 41);
+            assert.equal(proofPage?.hasMore, true);
+            assert.equal(typeof proofPage?.nextCursor, "string");
+
+            const mutation = mutationResult.details;
+            const mutationBytes = Buffer.byteLength(JSON.stringify(mutation), "utf8");
+            assert.ok((mutation.metadata?.proof?.length ?? 0) < 40);
+            assert.ok(mutationBytes <= MODEL_OUTPUT_BYTES);
+            assert.equal(mutation.proofPage?.total, 41);
+            assert.equal(mutation.proofPage?.hasMore, true);
+
+            const olderResult = await invoke("workboard_proof_list", "older-page", {
+              id: cardId,
+              limit: 40,
+              cursor: proofPage.nextCursor,
+            });
+            const older = olderResult.details;
+            assert.ok(older.proof.length > 0 && older.proof.length <= 40);
+            assert.ok(olderResult.textBytes <= MODEL_OUTPUT_BYTES);
+            assert.equal(older.proof.some((entry) => entry.id === firstProofId), true);
+
+            const canonical = await store.get(cardId);
+            assert.equal(canonical?.metadata?.proof?.length, 41);
+            assert.equal(Object.hasOwn(canonical ?? {}, "proofPage"), false);
+
+            console.log(
+              JSON.stringify(
+                {
+                  head: expectedHead,
+                  execution: "secretless fork-only GitHub Actions on raw head",
+                  sqliteRetention: {
+                    proofCountBefore: before.proofTotal,
+                    proofCountAfter: after.proofTotal,
+                    historicalRowUnchanged: true,
+                    independentMutation: "comment",
+                    canonicalProofCount: canonical.metadata.proof.length,
+                  },
+                  omittedProofView: {
+                    embeddedProofCount: embeddedProof.length,
+                    cardBytes,
+                    cardByteLimit: MODEL_OUTPUT_BYTES,
+                    modelTextBytes: readResult.textBytes,
+                    proofPage: {
+                      total: proofPage.total,
+                      hasMore: proofPage.hasMore,
+                      hasCursor: true,
+                    },
+                  },
+                  boundedMutationOutput: {
+                    cardBytes: mutationBytes,
+                    proofPageTotal: mutation.proofPage.total,
+                  },
+                  olderProofPagination: {
+                    pageCount: older.proof.length,
+                    modelTextBytes: olderResult.textBytes,
+                    historicalRowRetrieved: true,
+                  },
+                  redaction: {
+                    rawCardIdsPublished: false,
+                    rawProofIdsPublished: false,
+                    claimTokensPublished: false,
+                    statePathPublished: false,
+                  },
+                },
+                null,
+                2,
+              ),
+            );
+          } finally {
+            stores.close();
+          }
+          EOF
